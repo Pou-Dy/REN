@@ -5,7 +5,7 @@ import hashlib
 import secrets
 import time
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
 
@@ -153,10 +153,40 @@ def parse_size_to_bytes(value: float, unit: str) -> int:
     if unit == "KB": return int(value * 1024)
     return int(value)
 
+def compute_expiry(expiry_days) -> str:
+    """Turn a number of days into an absolute ISO expiry timestamp. 0/empty = no expiry."""
+    try:
+        days = float(expiry_days or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days <= 0:
+        return ""
+    return (datetime.now() + timedelta(days=days)).isoformat()
+
+def is_expired(link) -> bool:
+    """True if the link has an expiry date that is in the past."""
+    exp = link.get("expiry") if isinstance(link, dict) else None
+    if not exp:
+        return False
+    try:
+        return datetime.now() >= datetime.fromisoformat(exp)
+    except (TypeError, ValueError):
+        return False
+
+def expiry_epoch(link) -> int:
+    """Expiry as a unix timestamp for the subscription-userinfo header (0 = never)."""
+    exp = link.get("expiry") if isinstance(link, dict) else None
+    if not exp:
+        return 0
+    try:
+        return int(datetime.fromisoformat(exp).timestamp())
+    except (TypeError, ValueError):
+        return 0
+
 async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
-            LINKS["Default"] = {"label": "Default", "limit_bytes": 0, "used_bytes": 0, "max_connections": 0, "created_at": datetime.now().isoformat(), "active": True}
+            LINKS["Default"] = {"label": "Default", "limit_bytes": 0, "used_bytes": 0, "max_connections": 0, "created_at": datetime.now().isoformat(), "active": True, "expiry": ""}
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -272,17 +302,18 @@ async def create_link(request: Request, _=Depends(require_auth)):
     max_conn = int(body.get("max_connections") or 0)
     if max_conn < 0:
         max_conn = 0
+    expiry = compute_expiry(body.get("expiry_days"))
     uid = label
     async with LINKS_LOCK:
-        LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "created_at": datetime.now().isoformat(), "active": True}
-    return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"], "vless_link": generate_vless_link(uid, remark=f"REN-{label}")}
+        LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "created_at": datetime.now().isoformat(), "active": True, "expiry": expiry}
+    return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "active": True, "expiry": expiry, "created_at": LINKS[uid]["created_at"], "vless_link": generate_vless_link(uid, remark=f"REN-{label}")}
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
     async with LINKS_LOCK:
         for uid, data in LINKS.items():
-            result.append({"uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0), "active": data["active"], "created_at": data["created_at"], "current_connections": count_connections_for_link(uid), "vless_link": generate_vless_link(uid, remark=f"REN-{data['label']}")})
+            result.append({"uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0), "active": data["active"], "expiry": data.get("expiry", ""), "expired": is_expired(data), "created_at": data["created_at"], "current_connections": count_connections_for_link(uid), "vless_link": generate_vless_link(uid, remark=f"REN-{data['label']}")})
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
 
@@ -300,6 +331,8 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
         if "reset_usage" in body and body["reset_usage"]:
             LINKS[uid]["used_bytes"] = 0
+        if "expiry_days" in body:
+            LINKS[uid]["expiry"] = compute_expiry(body.get("expiry_days"))
         if "label" in body:
             LINKS[uid]["label"] = str(body["label"])[:60]
         if "max_connections" in body:
@@ -385,7 +418,7 @@ async def get_subscription(uid: str, _=Depends(require_auth)):
 # Remaining: {remaining_mb if limit > 0 else 'Unlimited'} MB
 # Usage: {pct}%
 # Status: {'Active' if link['active'] else 'Disabled'}
-# Expiry: Unlimited
+# Expiry: {link.get('expiry', '')[:10] if link.get('expiry') else 'Unlimited'}
 {vless_link}"""
     encoded = base64.b64encode(sub_content.encode()).decode()
     return {
@@ -413,6 +446,8 @@ async def subscription_endpoint(uid: str):
             raise HTTPException(status_code=404, detail="link not found")
     if not link["active"]:
         raise HTTPException(status_code=403, detail="link disabled")
+    if is_expired(link):
+        raise HTTPException(status_code=403, detail="link expired")
     async with CUSTOM_ADDRESSES_LOCK:
         addresses = list(CUSTOM_ADDRESSES)
     sub_links = []
@@ -428,7 +463,7 @@ async def subscription_endpoint(uid: str):
         "Content-Type": "text/plain; charset=utf-8",
         "Content-Disposition": "attachment; filename=\"sub.txt\"",
         "profile-update-interval": "6",
-        "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire=0"
+        "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire={expiry_epoch(link)}"
     }
     return Response(content=encoded, headers=headers)
 
@@ -461,6 +496,7 @@ async def check_quota(uid: str, extra_bytes: int) -> bool:
         link = LINKS.get(uid)
         if link is None: return False
         if not link["active"]: return False
+        if is_expired(link): return False
         if link["limit_bytes"] == 0: return True
         return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
 
@@ -518,6 +554,8 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             link_data = LINKS.get(uuid)
             if link_data is None or not link_data["active"]:
                 await websocket.close(code=1008, reason="link not found or disabled"); return
+            if is_expired(link_data):
+                await websocket.close(code=1008, reason="link expired"); return
             max_conn = link_data.get("max_connections", 0)
         if max_conn > 0:
             already_connected = client_ip in link_ip_map.get(uuid, set())
